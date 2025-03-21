@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
-    thread::{Builder, JoinHandle},
+    thread::{sleep, Builder, JoinHandle},
     time::{Duration, SystemTime},
 };
 
@@ -19,7 +19,7 @@ use prost::Message;
 use solana_metrics::{datapoint_info, datapoint_warn};
 use solana_perf::{
     deduper::Deduper,
-    packet::{PacketBatch, PacketBatchRecycler},
+    packet::{Meta, Packet, PacketBatch, PacketBatchRecycler, PACKET_DATA_SIZE},
     recycler::Recycler,
 };
 use solana_streamer::{
@@ -38,6 +38,7 @@ pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
 pub fn start_forwarder_threads(
+    udp_endpoint: SocketAddr,
     unioned_dest_sockets: Arc<ArcSwap<Vec<SocketAddr>>>, /* sockets shared between endpoint discovery thread and forwarders */
     src_addr: IpAddr,
     src_port: u16,
@@ -65,6 +66,7 @@ pub fn start_forwarder_threads(
         .enumerate()
         .flat_map(|(thread_id, incoming_shred_socket)| {
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
+            let packet_sender_clone = packet_sender.clone();
             let listen_thread = streamer::receiver(
                 format!("ssListen{thread_id}"),
                 Arc::new(incoming_shred_socket),
@@ -77,6 +79,48 @@ pub fn start_forwarder_threads(
                 None,
                 false,
             );
+
+            let _ = Builder::new()
+                .name(format!("udp_{thread_id}"))
+                .spawn(move || {
+                    loop {
+                        match UdpSocket::bind("127.0.0.1:0") {
+                            Err(_e) => {
+                                error!("UDP connection error {}: {:?}", thread_id, _e);
+                                sleep(Duration::from_secs(5));
+                            }
+                            Ok(socket) => {
+                                let mut buffer = [0; 1024];
+
+                                socket.connect(udp_endpoint).expect(
+                                    format!("Error connecting in UDP Server at {}", thread_id)
+                                        .as_str(),
+                                );
+
+                                loop {
+                                    match socket.recv_from(&mut buffer) {
+                                        Ok((size, _src)) => {
+                                            let mut packet_buffer = [0u8; PACKET_DATA_SIZE];
+                                            packet_buffer[..size].copy_from_slice(&buffer[..size]);
+                                            let packet =
+                                                Packet::new(packet_buffer, Meta::default());
+                                            let packet_batch = PacketBatch::new(vec![packet]);
+                                            packet_sender_clone.send(packet_batch).unwrap();
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "UDP Error receiving data {}: {}.",
+                                                thread_id, e
+                                            );
+                                            break; // Exit loop to trigger reconnection
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .unwrap();
 
             let deduper = deduper.clone();
             let unioned_dest_sockets = unioned_dest_sockets.clone();

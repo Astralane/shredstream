@@ -91,6 +91,11 @@ struct CommonArgs {
     #[arg(long, env, value_delimiter = ',', value_parser = resolve_hostname_port)]
     dest_ip_ports: Vec<(SocketAddr, String)>,
 
+    /// Static UDP Socket Endpoint.
+    /// `127.0.0.1:4500`
+    #[arg(long, env)]
+    udp_endpoint: SocketAddr,
+
     /// Http JSON endpoint to dynamically get IPs for Shredstream proxy to forward shreds.
     /// Endpoints are then set-union with `dest-ip-ports`.
     #[arg(long, env)]
@@ -245,6 +250,8 @@ fn main() -> Result<(), ShredstreamProxyError> {
             .collect::<Vec<SocketAddr>>(),
     ));
 
+    let udp_endpoint = args.udp_endpoint;
+
     // share deduper + metrics between forwarder <-> accessory thread
     // use mutex since metrics are write heavy. cheaper than rwlock
     let deduper = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
@@ -256,6 +263,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let use_discovery_service =
         args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
     let forwarder_hdls = forwarder::start_forwarder_threads(
+        udp_endpoint,
         unioned_dest_sockets.clone(),
         args.src_bind_addr,
         args.src_bind_port,
@@ -356,3 +364,5 @@ fn start_heartbeat(
         exit.clone(),
     )
 }
+
+
